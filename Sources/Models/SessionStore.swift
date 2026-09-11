@@ -17,6 +17,31 @@ struct ProjectGroup: Identifiable {
     var hasActiveSession: Bool {
         sessions.contains { $0.isActive }
     }
+
+    /// Match every search term across the project and session names.
+    /// Keep the original order so results don't jump around while typing.
+    func matching(_ query: String) -> ProjectGroup? {
+        let terms = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !terms.isEmpty else { return self }
+        let matches = sessions.filter { session in
+            let text = "\(profileName) \(session.name) \(session.displayName)"
+            return terms.allSatisfy { text.localizedStandardContains($0) }
+        }
+        guard !matches.isEmpty else { return nil }
+        var group = self
+        group.sessions = matches
+        return group
+    }
+}
+
+extension ITerm2Bridge.SessionInfo {
+    var displayName: String {
+        let shell = (name as NSString).lastPathComponent
+        if name.isEmpty || ["zsh", "bash", "sh", "fish", "-zsh", "-bash"].contains(shell) {
+            return "Session \(sessionIndex + 1)"
+        }
+        return name
+    }
 }
 
 /// Observable store that polls iTerm2 and maintains the current state.

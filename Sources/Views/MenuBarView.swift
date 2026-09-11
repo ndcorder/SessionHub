@@ -6,7 +6,18 @@ struct MenuBarView: View {
     @State private var renamingSession: ITerm2Bridge.SessionInfo?
     @State private var renameText: String = ""
     @State private var hoveredSessionId: String?
-    @State private var showNewSessionMenu = false
+    @State private var searchText = ""
+    @State private var collapsedProfiles: Set<String> = []
+    @FocusState private var searchFocused: Bool
+    @FocusState private var renameFocused: Bool
+
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var filteredGroups: [ProjectGroup] {
+        store.projectGroups.compactMap { $0.matching(searchText) }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -22,16 +33,21 @@ struct MenuBarView: View {
             } else if store.projectGroups.isEmpty {
                 emptyView
             } else {
-                // Session list
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(store.projectGroups) { group in
-                            projectGroupView(group)
+                searchView
+
+                if filteredGroups.isEmpty {
+                    noResultsView
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(filteredGroups) { group in
+                                projectGroupView(group)
+                            }
                         }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
+                    .frame(maxHeight: 400)
                 }
-                .frame(maxHeight: 400)
             }
 
             Divider()
@@ -39,7 +55,7 @@ struct MenuBarView: View {
             // Footer actions
             footerView
         }
-        .frame(width: 280)
+        .frame(width: 320)
     }
 
     // MARK: - Header
@@ -63,25 +79,81 @@ struct MenuBarView: View {
 
     // MARK: - Project Group
 
+    private var searchView: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search projects or sessions", text: $searchText)
+                .textFieldStyle(.plain)
+                .focused($searchFocused)
+                .onSubmit {
+                    if let session = filteredGroups.flatMap(\.sessions).first {
+                        store.switchToSession(session)
+                    }
+                }
+                .onExitCommand { searchText = "" }
+                .accessibilityLabel("Search projects or sessions")
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                    searchFocused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+                .help("Clear search (Escape)")
+            }
+        }
+        .font(.callout)
+        .padding(8)
+        .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+    }
+
     private func projectGroupView(_ group: ProjectGroup) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
+        let expanded = isSearching || !collapsedProfiles.contains(group.profileName)
+        return VStack(alignment: .leading, spacing: 1) {
             // Group header
             HStack(spacing: 6) {
-                Image(systemName: "folder.fill")
-                    .font(.caption)
-                    .foregroundStyle(colorForProfile(group.profileName))
+                Button {
+                    if collapsedProfiles.contains(group.profileName) {
+                        collapsedProfiles.remove(group.profileName)
+                    } else {
+                        collapsedProfiles.insert(group.profileName)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 10)
+                        Image(systemName: "folder.fill")
+                            .font(.caption)
+                            .foregroundStyle(colorForProfile(group.profileName))
 
-                Text(group.profileName)
-                    .font(.system(.subheadline, weight: .semibold))
+                        Text(group.profileName)
+                            .font(.system(.subheadline, weight: .semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
 
-                Text("\(group.sessionCount)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.secondary.opacity(0.15), in: Capsule())
+                        Text("\(group.sessionCount)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.secondary.opacity(0.15), in: Capsule())
 
-                Spacer()
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isSearching)
+                .accessibilityLabel("\(expanded ? "Collapse" : "Expand") \(group.profileName), \(group.sessionCount) sessions")
 
                 // Add tab button
                 Button {
@@ -98,8 +170,10 @@ struct MenuBarView: View {
             .padding(.vertical, 4)
 
             // Sessions in this group
-            ForEach(group.sessions) { session in
-                sessionRow(session, profileName: group.profileName)
+            if expanded {
+                ForEach(group.sessions) { session in
+                    sessionRow(session, profileName: group.profileName)
+                }
             }
         }
         .padding(.vertical, 2)
@@ -118,6 +192,9 @@ struct MenuBarView: View {
                     })
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.caption))
+                    .focused($renameFocused)
+                    .onAppear { renameFocused = true }
+                    .onExitCommand { renamingSession = nil }
 
                     Button("OK") {
                         store.renameSession(session, to: renameText)
@@ -139,7 +216,7 @@ struct MenuBarView: View {
                             .frame(width: 6, height: 6)
 
                         // Session name
-                        Text(displayName(for: session))
+                        Text(session.displayName)
                             .font(.system(.caption, weight: session.isActive ? .semibold : .regular))
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -162,6 +239,7 @@ struct MenuBarView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .help("\(session.name) — \(profileName), Tab \(session.tabIndex + 1)")
                 .onHover { isHovered in
                     hoveredSessionId = isHovered ? session.id : nil
                 }
@@ -179,6 +257,26 @@ struct MenuBarView: View {
     }
 
     // MARK: - States
+
+    private var noResultsView: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("No matching sessions")
+                .font(.subheadline)
+            Text("Try another project or session name.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Clear Search") {
+                searchText = ""
+                searchFocused = true
+            }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+    }
 
     private var notRunningView: some View {
         VStack(spacing: 8) {
@@ -284,15 +382,6 @@ struct MenuBarView: View {
 
     // MARK: - Helpers
 
-    private func displayName(for session: ITerm2Bridge.SessionInfo) -> String {
-        let name = session.name
-        // If the session name is just the shell path or empty, use a friendlier name
-        if name.isEmpty || name.hasSuffix("zsh") || name.hasSuffix("bash") {
-            return "Session \(session.sessionIndex + 1)"
-        }
-        return name
-    }
-
     private func addTabToProject(_ group: ProjectGroup) {
         // Add a new tab to the first window that has this profile
         if let firstSession = group.sessions.first {
@@ -305,7 +394,10 @@ struct MenuBarView: View {
     /// Returns a consistent color for a profile name.
     private func colorForProfile(_ name: String) -> Color {
         let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .red, .cyan, .mint, .indigo, .teal]
-        let hash = abs(name.hashValue)
-        return colors[hash % colors.count]
+        // Swift's hashValue is randomized each launch. Use a stable FNV-1a hash.
+        let hash = name.utf8.reduce(UInt64(14695981039346656037)) {
+            ($0 ^ UInt64($1)) &* 1099511628211
+        }
+        return colors[Int(hash % UInt64(colors.count))]
     }
 }

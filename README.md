@@ -23,7 +23,10 @@ SessionHub lives in your menu bar and shows all your iTerm2 sessions **grouped b
 - **Menu bar dropdown** — always one click away
 - **Sessions grouped by project** (iTerm2 profile)
 - **Click to switch** — activates the correct window and tab
-- **Right-click to rename** sessions
+- **Search projects and sessions** — combine terms (for example, `MyApp server`); Return opens the first result and Escape clears the search
+- **Collapsible projects** — hide groups you are not using; searching temporarily reveals matching sessions
+- **Consistent project colors** — colors stay the same between launches
+- **Right-click to rename** sessions; Escape cancels editing
 - **Create new tabs** per project with the ⊕ button
 - **Active session indicator** — green dot shows where you are
 - **Auto-refresh** — polls every 2 seconds in the background
@@ -83,7 +86,7 @@ The entire app is ~800 lines of Swift. Built in a single Claude Code session.
 PRs welcome! Some ideas for future improvements:
 
 - [ ] Floating sidebar panel (always-visible mode)
-- [ ] Search/filter sessions
+- [x] Search/filter sessions
 - [ ] Show git branch per session
 - [ ] Keyboard shortcuts for switching (⌘1-9)
 - [ ] Session status indicators (idle vs. active)
