@@ -3,23 +3,28 @@ import SwiftUI
 @main
 @MainActor
 struct SessionHubApp: App {
-    @State private var store = SessionStore()
+    @State private var controller: AppController
 
     init() {
-        // Start polling immediately at launch (connects via WebSocket, no TCC needed)
-        _store = State(initialValue: {
-            let s = SessionStore()
-            s.startPolling(interval: 3.0)
-            return s
-        }())
+        let demo = CommandLine.arguments.contains("--demo") || Bundle.main.object(forInfoDictionaryKey: "SessionHubDemo") as? Bool == true
+        _controller = State(initialValue: AppController(demo: demo))
     }
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(store: store)
+            controller.content().frame(width: 370)
         } label: {
-            Label("SessionHub", systemImage: "terminal")
+            if controller.store.preferences.showSessionCount {
+                Label("\(controller.store.sessionCount)", systemImage: "terminal")
+            } else {
+                Label(controller.store.isDemo ? "SessionHub Demo" : "SessionHub", systemImage: "terminal")
+            }
         }
         .menuBarExtraStyle(.window)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { controller.showSettings() }.keyboardShortcut(",")
+            }
+        }
     }
 }
