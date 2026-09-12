@@ -86,7 +86,7 @@ final class SessionStore {
             return
         }
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 if let error { self?.actionError = error.localizedDescription }
                 self?.refresh()
             }
@@ -101,7 +101,7 @@ final class SessionStore {
         stopPolling()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: max(1, interval), repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor [weak self] in self?.refresh() }
         }
         timer?.tolerance = min(1, interval / 5)
     }
