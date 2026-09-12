@@ -30,10 +30,10 @@ final class AppController {
         if demo { Task { @MainActor [weak self] in self?.togglePanel() } }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.store.stopPolling() }
+            Task { @MainActor [weak self] in self?.store.stopPolling() }
         })
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.store.reconnect() }
+            Task { @MainActor [weak self] in self?.store.reconnect() }
         })
     }
 
