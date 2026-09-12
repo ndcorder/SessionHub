@@ -84,7 +84,7 @@ struct ProtobufDecoder {
     private var offset: Int = 0
 
     init(_ data: Data) {
-        self.data = data
+        self.data = Data(data)
     }
 
     var hasMore: Bool { offset < data.count }
@@ -97,6 +97,7 @@ struct ProtobufDecoder {
         while offset < data.count {
             let byte = data[offset]
             offset += 1
+            guard shift < 63 || byte <= 1 else { throw ProtobufError.malformedVarint }
             result |= UInt64(byte & 0x7F) << shift
             if byte & 0x80 == 0 {
                 return result
@@ -116,6 +117,8 @@ struct ProtobufDecoder {
 
     mutating func readFieldHeader() throws -> FieldHeader {
         let tag = try readVarint()
+        guard tag >> 3 > 0, tag >> 3 <= 0x1fff_ffff else { throw ProtobufError.unexpectedFieldType }
+        guard [0, 1, 2, 5].contains(Int(tag & 7)) else { throw ProtobufError.unknownWireType(Int(tag & 7)) }
         return FieldHeader(
             fieldNumber: Int(tag >> 3),
             wireType: Int(tag & 0x07)
@@ -135,8 +138,10 @@ struct ProtobufDecoder {
     }
 
     mutating func readLengthDelimited() throws -> Data {
-        let length = Int(try readVarint())
-        guard offset + length <= data.count else {
+        let rawLength = try readVarint()
+        guard rawLength <= UInt64(data.count - offset) else { throw ProtobufError.unexpectedEnd }
+        let length = Int(rawLength)
+        guard length <= data.count - offset else {
             throw ProtobufError.unexpectedEnd
         }
         let result = data[offset..<(offset + length)]
@@ -156,11 +161,13 @@ struct ProtobufDecoder {
     mutating func skipField(wireType: Int) throws {
         switch wireType {
         case 0: _ = try readVarint()             // varint
-        case 1: offset += 8                       // 64-bit
+        case 1:
+            guard data.count - offset >= 8 else { throw ProtobufError.unexpectedEnd }
+            offset += 8
         case 2: _ = try readLengthDelimited()     // length-delimited
-        case 3: break                             // start group (deprecated) - skip tag only
-        case 4: break                             // end group (deprecated) - skip tag only
-        case 5: offset += 4                       // 32-bit
+        case 5:
+            guard data.count - offset >= 4 else { throw ProtobufError.unexpectedEnd }
+            offset += 4
         default: throw ProtobufError.unknownWireType(wireType)
         }
     }
@@ -179,11 +186,15 @@ enum ProtobufError: Error {
 /// Builds ClientOriginatedMessage protobuf payloads for iTerm2 API
 enum ITerm2Messages {
     private static var nextId: Int64 = 1
+    private static let idLock = NSLock()
 
     /// Generate unique message ID
     static func newId() -> Int64 {
-        defer { nextId += 1 }
-        return nextId
+        idLock.lock()
+        defer { idLock.unlock() }
+        let id = nextId
+        nextId = nextId == Int64.max ? 1 : nextId + 1
+        return id
     }
 
     // MARK: - Request Builders
@@ -263,31 +274,44 @@ enum ITerm2Messages {
 
     // MARK: - Response Parsers
 
-    /// Parse ServerOriginatedMessage to extract the id and submessage field number + data
-    static func parseResponse(_ data: Data) throws -> (id: Int64, fieldNumber: Int, payload: Data) {
-        var dec = ProtobufDecoder(data)
-        var msgId: Int64 = 0
-        var submessageField: Int = 0
-        var submessageData = Data()
+    struct Response {
+        let id: Int64?
+        let fieldNumber: Int
+        let payload: Data
+        let error: String?
+    }
 
+    /// Keep the request ID even on server errors, so the correct waiter is failed.
+    static func decodeResponse(_ data: Data) throws -> Response {
+        var dec = ProtobufDecoder(data)
+        var id: Int64?
+        var fieldNumber = 0
+        var payload = Data()
+        var error: String?
         while dec.hasMore {
             let header = try dec.readFieldHeader()
             switch header.fieldNumber {
-            case 1: // id
-                msgId = try dec.readInt64()
-            case 2: // error string
-                let errStr = try dec.readString()
-                throw ITerm2APIError.serverError(errStr)
+            case 1:
+                guard header.wireType == 0 else { throw ProtobufError.unexpectedFieldType }
+                id = try dec.readInt64()
+            case 2:
+                guard header.wireType == 2 else { throw ProtobufError.unexpectedFieldType }
+                error = try dec.readString()
             default:
                 if header.wireType == 2 {
-                    submessageField = header.fieldNumber
-                    submessageData = try dec.readLengthDelimited()
-                } else {
-                    try dec.skipField(wireType: header.wireType)
-                }
+                    fieldNumber = header.fieldNumber
+                    payload = try dec.readLengthDelimited()
+                } else { try dec.skipField(wireType: header.wireType) }
             }
         }
-        return (msgId, submessageField, submessageData)
+        guard error != nil || fieldNumber != 0 else { throw ProtobufError.unexpectedEnd }
+        return Response(id: id, fieldNumber: fieldNumber, payload: payload, error: error)
+    }
+
+    static func parseResponse(_ data: Data) throws -> (id: Int64, fieldNumber: Int, payload: Data) {
+        let response = try decodeResponse(data)
+        if let error = response.error { throw ITerm2APIError.serverError(error) }
+        return (response.id ?? 0, response.fieldNumber, response.payload)
     }
 
     // MARK: - ListSessions Response Parser
@@ -368,7 +392,7 @@ enum ITerm2Messages {
                 tabId = try dec.readString()
             case 3: // SplitTreeNode root
                 let nodeData = try dec.readLengthDelimited()
-                parseSplitTree(nodeData, into: &sessions)
+                try parseSplitTree(nodeData, into: &sessions)
             default:
                 try dec.skipField(wireType: header.wireType)
             }
@@ -376,41 +400,24 @@ enum ITerm2Messages {
         return ParsedTab(tabId: tabId, sessions: sessions)
     }
 
-    /// Recursively walk the SplitTreeNode to extract all SessionSummary leaves
-    private static func parseSplitTree(_ data: Data, into sessions: inout [ParsedSession]) {
+    /// Bound recursion and propagate malformed messages instead of publishing partial snapshots.
+    private static func parseSplitTree(_ data: Data, into sessions: inout [ParsedSession], depth: Int = 0) throws {
+        guard depth < 64 else { throw ProtobufError.unexpectedFieldType }
         var dec = ProtobufDecoder(data)
-
         while dec.hasMore {
-            guard let header = try? dec.readFieldHeader() else { return }
-            switch header.fieldNumber {
-            case 1: // bool vertical - skip
-                _ = try? dec.readBool()
-            case 2: // repeated SplitTreeLink links
-                guard let linkData = try? dec.readLengthDelimited() else { continue }
-                parseSplitTreeLink(linkData, into: &sessions)
-            default:
-                try? dec.skipField(wireType: header.wireType)
-            }
-        }
-    }
-
-    private static func parseSplitTreeLink(_ data: Data, into sessions: inout [ParsedSession]) {
-        var dec = ProtobufDecoder(data)
-
-        while dec.hasMore {
-            guard let header = try? dec.readFieldHeader() else { return }
-            switch header.fieldNumber {
-            case 1: // SessionSummary session
-                guard let sessionData = try? dec.readLengthDelimited() else { continue }
-                if let session = try? parseSessionSummary(sessionData) {
-                    sessions.append(session)
+            let header = try dec.readFieldHeader()
+            if header.fieldNumber == 2 {
+                let link = try dec.readLengthDelimited()
+                var linkDecoder = ProtobufDecoder(link)
+                while linkDecoder.hasMore {
+                    let field = try linkDecoder.readFieldHeader()
+                    switch field.fieldNumber {
+                    case 1: sessions.append(try parseSessionSummary(linkDecoder.readLengthDelimited()))
+                    case 2: try parseSplitTree(linkDecoder.readLengthDelimited(), into: &sessions, depth: depth + 1)
+                    default: try linkDecoder.skipField(wireType: field.wireType)
+                    }
                 }
-            case 2: // SplitTreeNode node (recursive)
-                guard let nodeData = try? dec.readLengthDelimited() else { continue }
-                parseSplitTree(nodeData, into: &sessions)
-            default:
-                try? dec.skipField(wireType: header.wireType)
-            }
+            } else { try dec.skipField(wireType: header.wireType) }
         }
     }
 

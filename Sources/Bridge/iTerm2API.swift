@@ -1,334 +1,229 @@
 import Foundation
 import Network
 
-/// WebSocket client for iTerm2's Python API.
-/// Connects via Unix domain socket with manual WebSocket handshake.
-/// No Apple Events / TCC required.
-final class ITerm2APIClient {
-    private var connection: NWConnection?
-    private var isConnected = false
-    private let queue = DispatchQueue(label: "com.sessionhub.iterm2api")
+/// All callbacks must run on the queue supplied to start().
+protocol APITransport: AnyObject {
+    var stateUpdate: ((APITransportState) -> Void)? { get set }
+    func start(queue: DispatchQueue)
+    func send(_ data: Data, completion: @escaping (Error?) -> Void)
+    func receive(completion: @escaping (Data?, Bool, Error?) -> Void)
+    func cancel()
+}
 
-    /// Pending response handlers keyed by message ID
-    private var pending: [Int64: (Result<(Int, Data), Error>) -> Void] = [:]
-    private let pendingLock = NSLock()
+enum APITransportState { case ready, failed(Error), closed }
 
-    // MARK: - Connection
+final class SocketTransport: APITransport {
+    private let connection: NWConnection
+    var stateUpdate: ((APITransportState) -> Void)?
 
-    /// Connect to iTerm2 API via Unix socket with manual WebSocket upgrade
-    func connect(completion: @escaping (Bool) -> Void) {
-        let socketPath = NSHomeDirectory() + "/Library/Application Support/iTerm2/private/socket"
+    init(path: String) {
+        let parameters = NWParameters(tls: nil)
+        parameters.defaultProtocolStack.transportProtocol = NWProtocolTCP.Options()
+        connection = NWConnection(to: .unix(path: path), using: parameters)
+    }
 
-        guard FileManager.default.fileExists(atPath: socketPath) else {
-            SHLog.log("[API] Socket not found at \(socketPath)")
-            completion(false)
-            return
-        }
-
-        SHLog.log("[API] Connecting to Unix socket: \(socketPath)")
-
-        // Raw TCP params (no WebSocket protocol layer — we'll do handshake manually)
-        let params = NWParameters(tls: nil)
-        let tcp = NWProtocolTCP.Options()
-        params.defaultProtocolStack.transportProtocol = tcp
-
-        let conn = NWConnection(to: .unix(path: socketPath), using: params)
-        self.connection = conn
-        var completed = false
-
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+    func start(queue: DispatchQueue) {
+        connection.stateUpdateHandler = { [weak self] state in
             switch state {
-            case .ready:
-                SHLog.log("[API] Raw socket connected, performing WebSocket upgrade...")
-                self.performWebSocketHandshake { success in
-                    if success {
-                        SHLog.log("[API] WebSocket handshake complete")
-                        self.isConnected = true
-                        if !completed {
-                            completed = true
-                            completion(true)
-                        }
-                        self.receiveLoop()
-                    } else {
-                        SHLog.log("[API] WebSocket handshake failed")
-                        if !completed {
-                            completed = true
-                            completion(false)
-                        }
-                    }
+            case .ready: self?.stateUpdate?(.ready)
+            case .failed(let error), .waiting(let error): self?.stateUpdate?(.failed(error))
+            case .cancelled: self?.stateUpdate?(.closed)
+            default: break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    func send(_ data: Data, completion: @escaping (Error?) -> Void) {
+        connection.send(content: data, completion: .contentProcessed { completion($0) })
+    }
+
+    func receive(completion: @escaping (Data?, Bool, Error?) -> Void) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, complete, error in
+            completion(data, complete, error)
+        }
+    }
+
+    func cancel() { connection.cancel() }
+}
+
+/// Serializes every connection transition and request callback on one private queue.
+/// Old socket callbacks are ignored after teardown; every waiter completes exactly once.
+final class ITerm2APIClient {
+    typealias Response = Result<(Int, Data), Error>
+    private let queue = DispatchQueue(label: "com.sessionhub.iterm2api")
+    private let factory: () -> APITransport
+    private let timeout: TimeInterval
+    private var transport: APITransport?
+    private var generation = UUID()
+    private var isConnected = false
+    private var connectWaiters: [(Bool) -> Void] = []
+    private var pending: [Int64: (Response) -> Void] = [:]
+    private var receiveBuffer = Data()
+    private var fragments: Data?
+    private var handshakeKey = ""
+
+    init(timeout: TimeInterval = 5, factory: (() -> APITransport)? = nil) {
+        self.timeout = timeout
+        self.factory = factory ?? {
+            SocketTransport(path: NSHomeDirectory() + "/Library/Application Support/iTerm2/private/socket")
+        }
+    }
+
+    var connected: Bool { queue.sync { isConnected } }
+
+    func connect(completion: @escaping (Bool) -> Void) {
+        queue.async {
+            if self.isConnected { completion(true); return }
+            self.connectWaiters.append(completion)
+            guard self.transport == nil else { return }
+            let socket = self.factory()
+            let token = UUID()
+            self.generation = token
+            self.transport = socket
+            self.handshakeKey = Data((0..<16).map { _ in UInt8.random(in: 0...255) }).base64EncodedString()
+            socket.stateUpdate = { [weak self] state in
+                guard let self, self.generation == token else { return }
+                switch state {
+                case .ready: self.beginHandshake(socket, token: token)
+                case .failed(let error): self.tearDown(error)
+                case .closed: self.tearDown(ITerm2APIError.notConnected)
                 }
-            case .failed(let error):
-                SHLog.log("[API] Connection failed: \(error)")
-                if !completed { completed = true; completion(false) }
-            case .waiting(let error):
-                SHLog.log("[API] Waiting: \(error)")
-                if !completed { completed = true; completion(false) }
-            case .cancelled:
-                SHLog.log("[API] Connection cancelled")
-                self.isConnected = false
-            default:
-                break
+            }
+            socket.start(queue: self.queue)
+            self.queue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
+                guard let self, self.generation == token, !self.isConnected else { return }
+                self.tearDown(ITerm2APIError.timeout)
             }
         }
-
-        conn.start(queue: queue)
-
-        queue.asyncAfter(deadline: .now() + 5.0) {
-            if !completed {
-                completed = true
-                SHLog.log("[API] Connection timeout")
-                conn.cancel()
-                completion(false)
-            }
-        }
-    }
-
-    // MARK: - WebSocket Handshake (manual)
-
-    private func performWebSocketHandshake(completion: @escaping (Bool) -> Void) {
-        guard let connection else { completion(false); return }
-
-        // Generate random key for Sec-WebSocket-Key
-        var keyBytes = [UInt8](repeating: 0, count: 16)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &keyBytes)
-        let wsKey = Data(keyBytes).base64EncodedString()
-
-        let request = [
-            "GET / HTTP/1.1",
-            "Host: localhost",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            "Sec-WebSocket-Key: \(wsKey)",
-            "Sec-WebSocket-Version: 13",
-            "Sec-WebSocket-Protocol: api.iterm2.com",
-            "Origin: ws://localhost/",
-            "x-iterm2-library-version: swift 1.0",
-            "x-iterm2-advisory-name: SessionHub",
-            "",
-            ""
-        ].joined(separator: "\r\n")
-
-        connection.send(content: request.data(using: .utf8), completion: .contentProcessed { error in
-            if let error {
-                SHLog.log("[API] Handshake send error: \(error)")
-                completion(false)
-                return
-            }
-        })
-
-        // Read the full HTTP 101 response (until \r\n\r\n)
-        self.readHTTPResponse(from: connection, buffer: Data()) { response in
-            if let response, response.contains("101") {
-                SHLog.log("[API] Got 101 Switching Protocols")
-                completion(true)
-            } else {
-                SHLog.log("[API] Unexpected handshake response: \(response?.prefix(200) ?? "nil")")
-                completion(false)
-            }
-        }
-    }
-
-    /// Read HTTP response incrementally until we see \r\n\r\n
-    private func readHTTPResponse(from conn: NWConnection, buffer: Data, completion: @escaping (String?) -> Void) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, error in
-            if let error {
-                SHLog.log("[API] Handshake receive error: \(error)")
-                completion(nil)
-                return
-            }
-            guard let data else {
-                completion(nil)
-                return
-            }
-            var accumulated = buffer
-            accumulated.append(data)
-
-            // Check if we have the full HTTP response (ends with \r\n\r\n)
-            if let str = String(data: accumulated, encoding: .utf8), str.contains("\r\n\r\n") {
-                completion(str)
-            } else if accumulated.count > 8192 {
-                // Safety: don't read forever
-                completion(String(data: accumulated, encoding: .utf8))
-            } else {
-                // Need more data
-                self.readHTTPResponse(from: conn, buffer: accumulated, completion: completion)
-            }
-        }
-    }
-
-    // MARK: - WebSocket Framing (manual)
-
-    /// Create a WebSocket binary frame (client must mask data)
-    private func createWebSocketFrame(_ payload: Data) -> Data {
-        var frame = Data()
-
-        // FIN + opcode 0x2 (binary)
-        frame.append(0x82)
-
-        // Mask bit set (client frames must be masked) + payload length
-        let len = payload.count
-        if len < 126 {
-            frame.append(UInt8(len) | 0x80)
-        } else if len < 65536 {
-            frame.append(126 | 0x80)
-            frame.append(UInt8((len >> 8) & 0xFF))
-            frame.append(UInt8(len & 0xFF))
-        } else {
-            frame.append(127 | 0x80)
-            for i in (0..<8).reversed() {
-                frame.append(UInt8((len >> (i * 8)) & 0xFF))
-            }
-        }
-
-        // Masking key (4 random bytes)
-        var maskKey = [UInt8](repeating: 0, count: 4)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 4, &maskKey)
-        frame.append(contentsOf: maskKey)
-
-        // Masked payload
-        for (i, byte) in payload.enumerated() {
-            frame.append(byte ^ maskKey[i % 4])
-        }
-
-        return frame
-    }
-
-    /// Parse a WebSocket frame, return the payload data
-    private func parseWebSocketFrame(_ data: Data) -> (payload: Data, consumed: Int)? {
-        guard data.count >= 2 else { return nil }
-
-        let byte0 = data[0]
-        let byte1 = data[1]
-        let masked = (byte1 & 0x80) != 0
-        var payloadLen = Int(byte1 & 0x7F)
-        var offset = 2
-
-        if payloadLen == 126 {
-            guard data.count >= 4 else { return nil }
-            payloadLen = Int(data[2]) << 8 | Int(data[3])
-            offset = 4
-        } else if payloadLen == 127 {
-            guard data.count >= 10 else { return nil }
-            payloadLen = 0
-            for i in 0..<8 {
-                payloadLen = payloadLen << 8 | Int(data[2 + i])
-            }
-            offset = 10
-        }
-
-        if masked { offset += 4 } // skip mask key (server frames usually not masked)
-
-        guard data.count >= offset + payloadLen else { return nil }
-
-        let payload = data[offset..<(offset + payloadLen)]
-        let _ = byte0 // opcode in lower 4 bits, we accept any
-
-        return (Data(payload), offset + payloadLen)
     }
 
     func disconnect() {
-        connection?.cancel()
-        connection = nil
+        queue.async { self.tearDown(ITerm2APIError.notConnected) }
+    }
+
+    private func tearDown(_ error: Error) {
+        generation = UUID()
+        let old = transport
+        transport = nil
         isConnected = false
-        pendingLock.lock()
-        let handlers = pending
+        receiveBuffer.removeAll()
+        fragments = nil
+        let waiters = connectWaiters
+        connectWaiters.removeAll()
+        let handlers = pending.values.map { $0 }
         pending.removeAll()
-        pendingLock.unlock()
-        for (_, handler) in handlers {
-            handler(.failure(ITerm2APIError.notConnected))
-        }
+        old?.stateUpdate = nil
+        old?.cancel()
+        waiters.forEach { $0(false) }
+        handlers.forEach { $0(.failure(error)) }
     }
 
-    var connected: Bool { isConnected }
-
-    // MARK: - Send / Receive
-
-    private func send(_ messageData: Data, id: Int64, completion: @escaping (Result<(Int, Data), Error>) -> Void) {
-        guard let connection, isConnected else {
-            completion(.failure(ITerm2APIError.notConnected))
-            return
+    private func beginHandshake(_ socket: APITransport, token: UUID) {
+        let request = [
+            "GET / HTTP/1.1", "Host: localhost", "Upgrade: websocket", "Connection: Upgrade",
+            "Sec-WebSocket-Key: \(handshakeKey)", "Sec-WebSocket-Version: 13",
+            "Sec-WebSocket-Protocol: api.iterm2.com", "Origin: ws://localhost/",
+            "x-iterm2-library-version: swift 1.0", "x-iterm2-advisory-name: SessionHub", "", ""
+        ].joined(separator: "\r\n")
+        socket.send(Data(request.utf8)) { [weak self] error in
+            guard let self, self.generation == token else { return }
+            if let error { self.tearDown(error) }
         }
-
-        pendingLock.lock()
-        pending[id] = completion
-        pendingLock.unlock()
-
-        let frame = createWebSocketFrame(messageData)
-
-        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
-            if let error {
-                SHLog.log("[API] Send error: \(error)")
-                self?.pendingLock.lock()
-                let handler = self?.pending.removeValue(forKey: id)
-                self?.pendingLock.unlock()
-                handler?(.failure(error))
-            }
-        })
-
-        // Timeout per request
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-            self?.pendingLock.lock()
-            let handler = self?.pending.removeValue(forKey: id)
-            self?.pendingLock.unlock()
-            handler?(.failure(ITerm2APIError.timeout))
-        }
+        receive(socket, token: token)
     }
 
-    private var receiveBuffer = Data()
-
-    private func receiveLoop() {
-        guard let connection, isConnected else { return }
-
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, _, error in
-            guard let self else { return }
-
-            if let error {
-                SHLog.log("[API] Receive error: \(error)")
-                return
-            }
-
-            if let data = content {
-                self.receiveBuffer.append(data)
-
-                // Try to parse complete frames from the buffer
-                while let frame = self.parseWebSocketFrame(self.receiveBuffer) {
-                    self.receiveBuffer = Data(self.receiveBuffer.dropFirst(frame.consumed))
-                    if !frame.payload.isEmpty {
-                        self.handleResponse(frame.payload)
+    private func receive(_ socket: APITransport, token: UUID) {
+        socket.receive { [weak self] data, complete, error in
+            guard let self, self.generation == token else { return }
+            if let error { self.tearDown(error); return }
+            do {
+                if let data { self.receiveBuffer.append(data) }
+                if !self.isConnected {
+                    if let end = try WebSocketCodec.validateHandshake(self.receiveBuffer, key: self.handshakeKey) {
+                        self.receiveBuffer = Data(self.receiveBuffer.dropFirst(end))
+                        self.isConnected = true
+                        let waiters = self.connectWaiters
+                        self.connectWaiters.removeAll()
+                        waiters.forEach { $0(true) }
                     }
                 }
-            }
+                if self.isConnected { try self.consumeFrames(socket, token: token) }
+                guard self.generation == token else { return }
+                if complete { self.tearDown(ITerm2APIError.notConnected); return }
+                self.receive(socket, token: token)
+            } catch { self.tearDown(error) }
+        }
+    }
 
-            if self.isConnected {
-                self.receiveLoop()
+    private func consumeFrames(_ socket: APITransport, token: UUID) throws {
+        while let frame = try WebSocketCodec.decode(receiveBuffer) {
+            receiveBuffer = Data(receiveBuffer.dropFirst(frame.consumed))
+            switch frame.opcode {
+            case 8:
+                tearDown(ITerm2APIError.notConnected)
+                return
+            case 9:
+                socket.send(WebSocketCodec.encode(frame.payload, opcode: 10)) { [weak self] error in
+                    guard let self, self.generation == token else { return }
+                    if let error { self.tearDown(error) }
+                }
+            case 10: break
+            case 2:
+                guard fragments == nil else { throw ITerm2APIError.connectionFailed("Unexpected data frame") }
+                if frame.final { try handleResponse(frame.payload) } else { fragments = frame.payload }
+            case 0:
+                guard var message = fragments, message.count <= WebSocketCodec.maximumPayload - frame.payload.count else {
+                    throw ITerm2APIError.connectionFailed("Invalid fragmented message")
+                }
+                message.append(frame.payload)
+                fragments = frame.final ? nil : message
+                if frame.final { try handleResponse(message) }
+            default: throw ITerm2APIError.connectionFailed("Expected a binary API message")
             }
         }
     }
 
-    private func handleResponse(_ data: Data) {
-        do {
-            let (id, fieldNumber, payload) = try ITerm2Messages.parseResponse(data)
-            pendingLock.lock()
-            let handler = pending.removeValue(forKey: id)
-            pendingLock.unlock()
-            handler?(.success((fieldNumber, payload)))
-        } catch {
-            SHLog.log("[API] Failed to parse response: \(error)")
+    private func handleResponse(_ data: Data) throws {
+        let response = try ITerm2Messages.decodeResponse(data)
+        guard let id = response.id else { return } // Unsolicited notifications.
+        let handler = pending.removeValue(forKey: id)
+        if let error = response.error {
+            handler?(.failure(ITerm2APIError.serverError(error)))
+        } else {
+            handler?(.success((response.fieldNumber, response.payload)))
         }
     }
 
-    // MARK: - Synchronous API (for bridge compatibility)
+    func send(_ messageData: Data, id: Int64, completion: @escaping (Response) -> Void) {
+        queue.async {
+            guard let socket = self.transport, self.isConnected else {
+                completion(.failure(ITerm2APIError.notConnected)); return
+            }
+            guard self.pending[id] == nil else {
+                completion(.failure(ITerm2APIError.serverError("Duplicate request ID"))); return
+            }
+            let token = self.generation
+            self.pending[id] = completion
+            socket.send(WebSocketCodec.encode(messageData)) { [weak self] error in
+                guard let self, self.generation == token else { return }
+                if let error { self.tearDown(error) }
+            }
+            self.queue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
+                guard let self, self.generation == token, self.pending[id] != nil else { return }
+                // A stalled socket is unusable. Fail all requests promptly and reconnect next time.
+                self.tearDown(ITerm2APIError.timeout)
+            }
+        }
+    }
 
-    private func sendSync(_ messageData: Data, id: Int64) -> Result<(Int, Data), Error> {
+    private func sendSync(_ messageData: Data, id: Int64) -> Response {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<(Int, Data), Error> = .failure(ITerm2APIError.timeout)
-
-        send(messageData, id: id) { r in
-            result = r
+        var result: Response = .failure(ITerm2APIError.timeout)
+        send(messageData, id: id) { response in
+            result = response
             semaphore.signal()
         }
-
         semaphore.wait()
         return result
     }

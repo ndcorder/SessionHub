@@ -10,6 +10,7 @@ let package = Package(
         .executableTarget(
             name: "SessionHub",
             path: "Sources"
-        )
+        ),
+        .testTarget(name: "SessionHubTests", dependencies: ["SessionHub"], path: "Tests")
     ]
 )
