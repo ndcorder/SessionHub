@@ -1,0 +1,27 @@
+name: macOS build and tests
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run regression tests
+        run: swift test
+      - name: Build signed app
+        run: ./build.sh
+      - name: Verify app signature
+        run: codesign --verify --deep --strict build/SessionHub.app
+      - name: Package app
+        run: ditto -c -k --sequesterRsrc --keepParent build/SessionHub.app build/SessionHub.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SessionHub-${{ matrix.os }}
+          path: build/SessionHub.zip
