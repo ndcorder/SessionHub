@@ -1,194 +1,117 @@
 import Foundation
 import AppKit
+import OSLog
 
-/// Simple file logger that always works regardless of build config
+/// Unified logging is bounded by macOS. Never log session names, paths, or payloads.
 enum SHLog {
-    private static let logFile: URL = {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".sessionhub.log")
-        // Truncate on launch
-        try? "".write(to: url, atomically: true, encoding: .utf8)
-        return url
-    }()
-
-    static func log(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
-        NSLog("[SessionHub] %@", message)
-        if let data = line.data(using: .utf8),
-           let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        }
-    }
+    private static let logger = Logger(subsystem: "com.sessionhub.app", category: "connection")
+    static func log(_ message: String) { logger.info("\(message, privacy: .private)") }
 }
 
-/// Communicates with iTerm2 via its Python API (WebSocket + protobuf).
-/// No Apple Events or TCC permission required.
-final class ITerm2Bridge {
+struct SessionSnapshot {
+    var sessions: [ITerm2Bridge.SessionInfo]
+    var profiles: [String]
+}
 
-    // MARK: - Data Types
+@MainActor
+protocol SessionService {
+    func isRunning() -> Bool
+    func snapshot() async throws -> SessionSnapshot
+    func disconnect()
+    func activate(_ session: ITerm2Bridge.SessionInfo) async throws
+    func create(profile: String, windowId: String?) async throws
+    func rename(_ session: ITerm2Bridge.SessionInfo, to name: String) async throws
+    func split(_ session: ITerm2Bridge.SessionInfo, vertical: Bool) async throws
+    func close(_ session: ITerm2Bridge.SessionInfo) async throws
+}
 
-    struct WindowInfo: Identifiable {
-        let id: String       // iTerm2 window_id string (was Int for AppleScript)
-        let name: String
-        let number: Int32
-        var tabs: [TabInfo]
-    }
-
-    struct TabInfo: Identifiable {
-        var id: String { tabId }
-        let tabId: String
-        let windowId: String
-        let index: Int
-        var sessions: [SessionInfo]
-    }
-
-    struct SessionInfo: Identifiable {
-        let id: String          // unique_identifier from iTerm2
+/// Communicates only through the local iTerm2 API; never reads terminal scrollback.
+final class ITerm2Bridge: SessionService {
+    struct SessionInfo: Identifiable, Equatable, Codable {
+        let id: String
         let windowId: String
         let tabId: String
         let tabIndex: Int
         let sessionIndex: Int
         let profileName: String
-        let name: String
-        let isActive: Bool
+        var name: String
+        var isActive: Bool
+        var directory: String = ""
+        var hostname: String = ""
+        var job: String = ""
+        var gitBranch: String = ""
+        var windowNumber: Int32 = 0
     }
 
-    // MARK: - API Client
+    private let client: ITerm2APIClient
+    init(client: ITerm2APIClient = ITerm2APIClient()) { self.client = client }
 
-    private let apiClient = ITerm2APIClient()
-    private var apiConnected = false
-
-    /// Ensure we're connected to the API. Returns true if connected.
-    func ensureConnected() -> Bool {
-        if apiClient.connected { return true }
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var success = false
-
-        apiClient.connect { connected in
-            success = connected
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-        apiConnected = success
-
-        if !success {
-            SHLog.log("[Bridge] Failed to connect to iTerm2 API. Is Python API enabled?")
-        }
-        return success
+    func isRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").isEmpty
     }
+    func disconnect() { client.disconnect() }
 
-    // MARK: - Check if iTerm2 is running (no API needed)
-
-    func isITerm2Running() -> Bool {
-        NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").first != nil
-    }
-
-    // MARK: - Fetch All Sessions
-
-    func fetchSessions() -> [WindowInfo] {
-        guard isITerm2Running() else {
-            SHLog.log("fetchSessions: iTerm2 not running")
-            return []
+    func snapshot() async throws -> SessionSnapshot {
+        async let profiles = client.profiles()
+        let windows = try await client.listSessions()
+        var activeId: String?
+        if !windows.isEmpty {
+            do { activeId = try await client.variables(sessionId: "active", names: ["id"])["id"] }
+            catch SessionAPIError.rejected(_, let status) where status == 1 { activeId = nil }
         }
-
-        guard ensureConnected() else {
-            SHLog.log("fetchSessions: not connected to API")
-            return []
-        }
-
-        SHLog.log("fetchSessions: querying via API")
-
-        let parsedWindows = apiClient.listSessions()
-        if parsedWindows.isEmpty {
-            SHLog.log("fetchSessions: no windows returned")
-            return []
-        }
-
-        // Now fetch profile names for all sessions
-        var windows: [WindowInfo] = []
-
-        for pw in parsedWindows {
-            var tabs: [TabInfo] = []
-
-            for (tabIdx, pt) in pw.tabs.enumerated() {
-                var sessions: [SessionInfo] = []
-
-                for (sessIdx, ps) in pt.sessions.enumerated() {
-                    // Fetch profile name for this session
-                    let profileName = apiClient.getProfileName(sessionId: ps.uniqueId) ?? "Default"
-
-                    let session = SessionInfo(
-                        id: ps.uniqueId,
-                        windowId: pw.windowId,
-                        tabId: pt.tabId,
-                        tabIndex: tabIdx,
-                        sessionIndex: sessIdx,
-                        profileName: profileName,
-                        name: ps.title,
-                        isActive: false  // Will determine active session separately
-                    )
-                    sessions.append(session)
+        var summaries: [SessionInfo] = []
+        for window in windows {
+            for (tabIndex, tab) in window.tabs.enumerated() {
+                for (sessionIndex, session) in tab.sessions.enumerated() {
+                    summaries.append(SessionInfo(id: session.uniqueId, windowId: window.windowId, tabId: tab.tabId,
+                                                 tabIndex: tabIndex, sessionIndex: sessionIndex, profileName: "",
+                                                 name: session.title, isActive: session.uniqueId == activeId,
+                                                 windowNumber: window.windowNumber))
                 }
-
-                let tab = TabInfo(
-                    tabId: pt.tabId,
-                    windowId: pw.windowId,
-                    index: tabIdx,
-                    sessions: sessions
-                )
-                tabs.append(tab)
             }
-
-            let window = WindowInfo(
-                id: pw.windowId,
-                name: "Window \(pw.windowNumber)",
-                number: pw.windowNumber,
-                tabs: tabs
-            )
-            windows.append(window)
         }
-
-        SHLog.log("fetchSessions: found \(windows.count) window(s)")
-        return windows
-    }
-
-    // MARK: - Switch Focus
-
-    func switchToSession(sessionId: String) {
-        guard ensureConnected() else { return }
-
-        let success = apiClient.activate(sessionId: sessionId)
-        if !success {
-            SHLog.log("[Bridge] Failed to activate session \(sessionId)")
+        // Bound concurrency so a large session list cannot flood the socket.
+        var sessions: [SessionInfo] = []
+        for start in stride(from: 0, to: summaries.count, by: 8) {
+            let batch = Array(summaries[start..<min(start + 8, summaries.count)])
+            let enriched = try await withThrowingTaskGroup(of: (Int, SessionInfo?).self) { group in
+                for (index, session) in batch.enumerated() {
+                    group.addTask { [client] in
+                        do {
+                            let values = try await client.variables(sessionId: session.id,
+                                names: ["profileName", "path", "hostname", "jobName", "user.gitBranch"])
+                            let result = SessionInfo(id: session.id, windowId: session.windowId, tabId: session.tabId,
+                                tabIndex: session.tabIndex, sessionIndex: session.sessionIndex,
+                                profileName: values["profileName"] ?? "Default", name: session.name, isActive: session.isActive,
+                                directory: values["path"] ?? "", hostname: values["hostname"] ?? "", job: values["jobName"] ?? "",
+                                gitBranch: values["user.gitBranch"] ?? "", windowNumber: session.windowNumber)
+                            return (index, result)
+                        } catch SessionAPIError.rejected(_, let status) where status == 1 {
+                            return (index, nil) // A session may close between list and metadata queries.
+                        }
+                    }
+                }
+                var result: [(Int, SessionInfo?)] = []
+                for try await value in group { result.append(value) }
+                return result.sorted { $0.0 < $1.0 }.compactMap(\.1)
+            }
+            sessions.append(contentsOf: enriched)
         }
-
-        // Also bring iTerm2 to front
-        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").first {
-            app.activate()
-        }
+        return try await SessionSnapshot(sessions: sessions, profiles: profiles)
     }
 
-    // MARK: - Create
-
-    func createTab(withProfile profile: String, inWindowId windowId: String) {
-        guard ensureConnected() else { return }
-        _ = apiClient.createTab(profileName: profile, windowId: windowId)
+    func activate(_ session: SessionInfo) async throws {
+        try await client.activate(sessionId: session.id)
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").first?.activate()
     }
-
-    func createWindow(withProfile profile: String) {
-        guard ensureConnected() else { return }
-        _ = apiClient.createTab(profileName: profile, windowId: nil)
+    func create(profile: String, windowId: String?) async throws {
+        try await client.createTab(profileName: profile, windowId: windowId)
     }
-
-    // MARK: - Rename
-
-    func renameSession(sessionId: String, name: String) {
-        guard ensureConnected() else { return }
-        _ = apiClient.renameSession(sessionId: sessionId, name: name)
+    func rename(_ session: SessionInfo, to name: String) async throws {
+        try await client.renameSession(sessionId: session.id, name: name)
     }
+    func split(_ session: SessionInfo, vertical: Bool) async throws {
+        try await client.splitPane(sessionId: session.id, profile: session.profileName, vertical: vertical)
+    }
+    func close(_ session: SessionInfo) async throws { try await client.closeSession(sessionId: session.id) }
 }

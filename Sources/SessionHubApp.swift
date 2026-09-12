@@ -1,6 +1,7 @@
 import SwiftUI
 
 @main
+@MainActor
 struct SessionHubApp: App {
     @State private var store = SessionStore()
 

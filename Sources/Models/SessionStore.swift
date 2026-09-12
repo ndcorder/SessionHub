@@ -1,12 +1,11 @@
 import Foundation
-import Combine
+import AppKit
 
 /// Groups sessions by their iTerm2 profile name, representing a "project".
-struct ProjectGroup: Identifiable {
+struct ProjectGroup: Identifiable, Equatable {
     var id: String { profileName }
     let profileName: String
     var sessions: [ITerm2Bridge.SessionInfo]
-    var isExpanded: Bool = true
 
     var windowIds: Set<String> {
         Set(sessions.map(\.windowId))
@@ -23,8 +22,9 @@ struct ProjectGroup: Identifiable {
     func matching(_ query: String) -> ProjectGroup? {
         let terms = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         guard !terms.isEmpty else { return self }
+        if sessions.isEmpty, terms.allSatisfy({ profileName.localizedStandardContains($0) }) { return self }
         let matches = sessions.filter { session in
-            let text = "\(profileName) \(session.name) \(session.displayName)"
+            let text = "\(profileName) \(session.name) \(session.displayName) \(session.directory) \(session.hostname) \(session.job) \(session.gitBranch)"
             return terms.allSatisfy { text.localizedStandardContains($0) }
         }
         guard !matches.isEmpty else { return nil }
@@ -44,153 +44,194 @@ extension ITerm2Bridge.SessionInfo {
     }
 }
 
-/// Observable store that polls iTerm2 and maintains the current state.
+/// Main-actor state and coalesced asynchronous refreshes. Failed polls never erase a good snapshot.
+@MainActor
 @Observable
 final class SessionStore {
-    var projectGroups: [ProjectGroup] = []
-    var isITerm2Running: Bool = false
-    var isAPIConnected: Bool = false
-    var lastUpdated: Date?
+    private(set) var projectGroups: [ProjectGroup] = []
+    private(set) var profiles: [String] = []
+    private(set) var isITerm2Running = false
+    private(set) var isAPIConnected = false
+    private(set) var hasLoaded = false
+    private(set) var isRefreshing = false
+    private(set) var isPerformingAction = false
+    private(set) var lastUpdated: Date?
+    var connectionMessage: String?
+    var actionError: String?
+    var notice: String?
 
-    private let bridge = ITerm2Bridge()
-    private var timer: Timer?
-    private var pollingInterval: TimeInterval = 2.0
-    private var hasCompletedInitialRefresh = false
+    let preferences: AppPreferences
+    @ObservationIgnored private let service: SessionService
+    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshGeneration = UUID()
+    @ObservationIgnored private var refreshAfterAction = false
 
-    /// Low-priority queue for background polling — never blocks user actions
-    private var isRefreshing = false
-    private let pollQueue = DispatchQueue(label: "com.sessionhub.poll", qos: .userInitiated)
-    /// High-priority queue for user-triggered actions — runs immediately
-    private let actionQueue = DispatchQueue(label: "com.sessionhub.action", qos: .userInteractive)
+    init(service: SessionService? = nil, preferences: AppPreferences? = nil) {
+        self.service = service ?? ITerm2Bridge()
+        self.preferences = preferences ?? AppPreferences()
+    }
 
-    // MARK: - Polling
+    var isDemo: Bool { service is DemoSessionService }
 
-    func startPolling(interval: TimeInterval = 2.0) {
-        pollingInterval = interval
-        SHLog.log("[SessionHub] Starting polling (interval: \(interval)s) — no TCC needed")
-
+    func setDemoMode(_ mode: DemoSessionService.Mode) {
+        (service as? DemoSessionService)?.mode = mode
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
+    }
+
+    func launchITerm() {
+        guard !isDemo else { setDemoMode(.connected); return }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.googlecode.iterm2") else {
+            actionError = "Install iTerm2 to use SessionHub. The setup guide has the download link."
+            return
         }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+            Task { @MainActor in
+                if let error { self?.actionError = error.localizedDescription }
+                self?.refresh()
+            }
+        }
+    }
+
+    var sessions: [ITerm2Bridge.SessionInfo] { projectGroups.flatMap(\.sessions) }
+    var sessionCount: Int { sessions.count }
+    var canAct: Bool { isAPIConnected && !isPerformingAction }
+
+    func startPolling(interval: TimeInterval = 3) {
+        stopPolling()
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: max(1, interval), repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        timer?.tolerance = min(1, interval / 5)
     }
 
     func stopPolling() {
         timer?.invalidate()
         timer = nil
+        refreshGeneration = UUID()
+        refreshTask?.cancel()
+        refreshTask = nil
+        isRefreshing = false
+        refreshAfterAction = false
     }
 
-    // MARK: - Refresh
-
-    func refresh() {
-        if !hasCompletedInitialRefresh {
-            SHLog.log("[SessionHub] Running initial refresh")
-            pollQueue.async { [weak self] in
-                self?.performRefresh()
-                self?.hasCompletedInitialRefresh = true
+    @discardableResult
+    func refresh() -> Task<Void, Never>? {
+        guard !isRefreshing else { return refreshTask }
+        isRefreshing = true
+        let generation = refreshGeneration
+        refreshTask = Task {
+            defer {
+                if generation == refreshGeneration {
+                    isRefreshing = false
+                    refreshTask = nil
+                    if refreshAfterAction {
+                        refreshAfterAction = false
+                        refresh()
+                    }
+                }
             }
-            return
-        }
-
-        pollQueue.async { [weak self] in
-            guard let self else { return }
-            guard !self.isRefreshing else {
-                SHLog.log("[SessionHub] Skipping refresh — previous poll still running")
+            isITerm2Running = service.isRunning()
+            guard isITerm2Running else {
+                service.disconnect()
+                isAPIConnected = false
+                projectGroups = []
+                profiles = []
+                connectionMessage = nil
+                hasLoaded = true
                 return
             }
-            self.performRefresh()
+            do {
+                let snapshot = try await service.snapshot()
+                guard !Task.isCancelled, generation == refreshGeneration else { return }
+                let nextGroups = Self.groupByProfile(snapshot.sessions)
+                if projectGroups != nextGroups { projectGroups = nextGroups }
+                if profiles != snapshot.profiles { profiles = snapshot.profiles }
+                isAPIConnected = true
+                connectionMessage = nil
+                lastUpdated = Date()
+            } catch {
+                guard !Task.isCancelled, generation == refreshGeneration else { return }
+                isAPIConnected = false
+                connectionMessage = Self.message(for: error)
+            }
+            hasLoaded = true
+        }
+        return refreshTask
+    }
+
+    func reconnect() {
+        stopPolling()
+        service.disconnect()
+        startPolling(interval: preferences.refreshInterval)
+    }
+
+    @discardableResult
+    func switchToSession(_ session: ITerm2Bridge.SessionInfo) -> Task<Void, Never>? {
+        runAction {
+            try await self.service.activate(session)
+            self.preferences.recordVisit(session.id)
         }
     }
 
-    private func performRefresh() {
-        isRefreshing = true
+    @discardableResult
+    func createTab(forProfile profile: String, inWindowId windowId: String) -> Task<Void, Never>? {
+        runAction { try await self.service.create(profile: profile, windowId: windowId) }
+    }
 
-        let running = bridge.isITerm2Running()
-        let groups: [ProjectGroup]
-        let connected: Bool
+    @discardableResult
+    func createWindow(withProfile profile: String) -> Task<Void, Never>? {
+        runAction { try await self.service.create(profile: profile, windowId: nil) }
+    }
 
-        if running {
-            connected = bridge.ensureConnected()
-            if connected {
-                let windows = bridge.fetchSessions()
-                if windows.isEmpty {
-                    SHLog.log("[SessionHub] iTerm2 API returned no windows")
-                } else {
-                    SHLog.log("[SessionHub] Found \(windows.count) window(s)")
-                }
-                groups = Self.groupByProfile(windows: windows)
-            } else {
-                SHLog.log("[SessionHub] iTerm2 running but API not connected")
-                groups = []
-            }
-        } else {
-            SHLog.log("[SessionHub] iTerm2 is not running")
-            connected = false
-            groups = []
-        }
-
-        DispatchQueue.main.async {
-            self.isITerm2Running = running
-            self.isAPIConnected = connected
-            self.projectGroups = groups
-            self.lastUpdated = Date()
-            self.isRefreshing = false
+    func renameSession(_ session: ITerm2Bridge.SessionInfo, to name: String) async -> Bool {
+        await performAction {
+            try await self.service.rename(session, to: name)
         }
     }
 
-    // MARK: - Actions (all run on separate high-priority queue)
-
-    func switchToSession(_ session: ITerm2Bridge.SessionInfo) {
-        actionQueue.async { [weak self] in
-            self?.bridge.switchToSession(sessionId: session.id)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self?.refresh()
-            }
-        }
+    @discardableResult
+    func splitSession(_ session: ITerm2Bridge.SessionInfo, vertical: Bool) -> Task<Void, Never>? {
+        runAction { try await self.service.split(session, vertical: vertical) }
     }
 
-    func createTab(forProfile profile: String, inWindowId windowId: String) {
-        actionQueue.async { [weak self] in
-            self?.bridge.createTab(withProfile: profile, inWindowId: windowId)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                self?.refresh()
-            }
-        }
+    @discardableResult
+    func closeSession(_ session: ITerm2Bridge.SessionInfo) -> Task<Void, Never>? {
+        runAction { try await self.service.close(session) }
     }
 
-    func createWindow(withProfile profile: String) {
-        actionQueue.async { [weak self] in
-            self?.bridge.createWindow(withProfile: profile)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                self?.refresh()
-            }
-        }
+    private func runAction(_ action: @escaping () async throws -> Void) -> Task<Void, Never>? {
+        guard canAct else { return nil }
+        // Set this before scheduling the task to coalesce double clicks.
+        isPerformingAction = true
+        return Task { _ = await executeAction(action) }
     }
 
-    func renameSession(_ session: ITerm2Bridge.SessionInfo, to name: String) {
-        actionQueue.async { [weak self] in
-            self?.bridge.renameSession(sessionId: session.id, name: name)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                self?.refresh()
-            }
-        }
+    private func performAction(_ action: @escaping () async throws -> Void) async -> Bool {
+        guard canAct else { return false }
+        isPerformingAction = true
+        return await executeAction(action)
     }
 
-    // MARK: - Helpers
-
-    private static func groupByProfile(windows: [ITerm2Bridge.WindowInfo]) -> [ProjectGroup] {
-        var grouped: [String: [ITerm2Bridge.SessionInfo]] = [:]
-
-        for window in windows {
-            for tab in window.tabs {
-                for session in tab.sessions {
-                    grouped[session.profileName, default: []].append(session)
-                }
-            }
+    private func executeAction(_ action: () async throws -> Void) async -> Bool {
+        defer {
+            isPerformingAction = false
+            if isRefreshing { refreshAfterAction = true } else { refresh() }
         }
+        actionError = nil
+        do { try await action(); return true }
+        catch { actionError = Self.message(for: error); return false }
+    }
 
-        return grouped.map { profileName, sessions in
-            ProjectGroup(profileName: profileName, sessions: sessions)
-        }.sorted { $0.profileName.lowercased() < $1.profileName.lowercased() }
+    static func groupByProfile(_ sessions: [ITerm2Bridge.SessionInfo]) -> [ProjectGroup] {
+        Dictionary(grouping: sessions, by: \.profileName).map {
+            ProjectGroup(profileName: $0.key, sessions: $0.value)
+        }.sorted { $0.profileName.localizedStandardCompare($1.profileName) == .orderedAscending }
+    }
+
+    private static func message(for error: Error) -> String {
+        if let apiError = error as? ITerm2APIError { return apiError.description }
+        return error.localizedDescription
     }
 }

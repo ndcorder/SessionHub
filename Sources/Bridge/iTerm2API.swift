@@ -57,6 +57,7 @@ final class ITerm2APIClient {
     private var transport: APITransport?
     private var generation = UUID()
     private var isConnected = false
+    private var connectionFailure: Error?
     private var connectWaiters: [(Bool) -> Void] = []
     private var pending: [Int64: (Response) -> Void] = [:]
     private var receiveBuffer = Data()
@@ -107,6 +108,7 @@ final class ITerm2APIClient {
         let old = transport
         transport = nil
         isConnected = false
+        connectionFailure = error
         receiveBuffer.removeAll()
         fragments = nil
         let waiters = connectWaiters
@@ -143,6 +145,7 @@ final class ITerm2APIClient {
                     if let end = try WebSocketCodec.validateHandshake(self.receiveBuffer, key: self.handshakeKey) {
                         self.receiveBuffer = Data(self.receiveBuffer.dropFirst(end))
                         self.isConnected = true
+                        self.connectionFailure = nil
                         let waiters = self.connectWaiters
                         self.connectWaiters.removeAll()
                         waiters.forEach { $0(true) }
@@ -217,91 +220,84 @@ final class ITerm2APIClient {
         }
     }
 
-    private func sendSync(_ messageData: Data, id: Int64) -> Response {
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Response = .failure(ITerm2APIError.timeout)
-        send(messageData, id: id) { response in
-            result = response
-            semaphore.signal()
+    func request(_ message: (id: Int64, data: Data), expectedField: Int) async throws -> Data {
+        let available = await withCheckedContinuation { continuation in
+            connect { continuation.resume(returning: $0) }
         }
-        semaphore.wait()
+        guard available else { throw queue.sync { connectionFailure ?? ITerm2APIError.notConnected } }
+        let response: (Int, Data) = try await withCheckedThrowingContinuation { continuation in
+            send(message.data, id: message.id) { continuation.resume(with: $0) }
+        }
+        guard response.0 == expectedField else { throw SessionAPIError.unexpectedResponse }
+        return response.1
+    }
+
+    func listSessions() async throws -> [ITerm2Messages.ParsedWindow] {
+        try ITerm2Messages.parseListSessions(await request(ITerm2Messages.listSessions(), expectedField: 106))
+    }
+
+    func variables(sessionId: String, names: [String]) async throws -> [String: String] {
+        let payload = try await request(ITerm2Messages.variables(sessionId: sessionId, names: names), expectedField: 115)
+        let fields = try MessageFields(payload)
+        try fields.requireOK("Read session")
+        let values = try fields.strings(2)
+        guard values.count == names.count else { throw SessionAPIError.unexpectedResponse }
+        var result: [String: String] = [:]
+        for (name, value) in zip(names, values) {
+            if value == "null" { continue }
+            let decoded = try JSONSerialization.jsonObject(with: Data(value.utf8), options: .fragmentsAllowed)
+            result[name] = decoded as? String
+        }
         return result
     }
 
-    // MARK: - High-Level API
-
-    func listSessions() -> [ITerm2Messages.ParsedWindow] {
-        let (id, data) = ITerm2Messages.listSessions()
-        switch sendSync(data, id: id) {
-        case .success(let (fieldNumber, payload)):
-            guard fieldNumber == 106 else {
-                SHLog.log("[API] Unexpected response field \(fieldNumber) for listSessions")
-                return []
-            }
-            do {
-                return try ITerm2Messages.parseListSessions(payload)
-            } catch {
-                SHLog.log("[API] Failed to parse ListSessionsResponse: \(error)")
-                return []
-            }
-        case .failure(let error):
-            SHLog.log("[API] listSessions failed: \(error)")
-            return []
-        }
-    }
-
-    func getProfileName(sessionId: String) -> String? {
-        let (id, data) = ITerm2Messages.getProfileProperty(sessionId: sessionId, keys: ["Name"])
-        switch sendSync(data, id: id) {
-        case .success(let (fieldNumber, payload)):
-            guard fieldNumber == 110 else { return nil }
-            if let props = try? ITerm2Messages.parseGetProfileProperty(payload),
-               let nameProp = props.first(where: { $0.key == "Name" }) {
-                if let jsonData = nameProp.jsonValue.data(using: .utf8),
-                   let name = try? JSONSerialization.jsonObject(with: jsonData) as? String {
-                    return name
+    func profiles() async throws -> [String] {
+        var body = ProtobufEncoder()
+        body.writeString(1, value: "Name")
+        let payload = try await request(ITerm2Messages.request(118, body: body), expectedField: 118)
+        let profiles = try MessageFields(payload)
+        var names: Set<String> = []
+        for profile in profiles.bytes[1, default: []] {
+            for property in try MessageFields(profile).bytes[1, default: []] {
+                let fields = try MessageFields(property)
+                if try fields.strings(1).first == "Name", let json = try fields.strings(2).first {
+                    names.insert(try JSONDecoder().decode(String.self, from: Data(json.utf8)))
                 }
-                return nameProp.jsonValue
             }
-            return nil
-        case .failure:
-            return nil
         }
+        return names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
-    func activate(sessionId: String) -> Bool {
-        let (id, data) = ITerm2Messages.activate(sessionId: sessionId)
-        switch sendSync(data, id: id) {
-        case .success(let (fieldNumber, _)):
-            return fieldNumber == 114
-        case .failure(let error):
-            SHLog.log("[API] activate failed: \(error)")
-            return false
-        }
+    func activate(sessionId: String) async throws {
+        let payload = try await request(ITerm2Messages.activate(sessionId: sessionId), expectedField: 114)
+        try MessageFields(payload).requireOK("Activate session")
     }
 
-    func createTab(profileName: String, windowId: String? = nil) -> ITerm2Messages.CreateTabResult? {
-        let (id, data) = ITerm2Messages.createTab(profileName: profileName, windowId: windowId)
-        switch sendSync(data, id: id) {
-        case .success(let (fieldNumber, payload)):
-            guard fieldNumber == 108 else { return nil }
-            return try? ITerm2Messages.parseCreateTab(payload)
-        case .failure:
-            return nil
-        }
+    func createTab(profileName: String, windowId: String? = nil) async throws {
+        let payload = try await request(ITerm2Messages.createTab(profileName: profileName, windowId: windowId), expectedField: 108)
+        try MessageFields(payload).requireOK("Create tab")
     }
 
-    func renameSession(sessionId: String, name: String) -> Bool {
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: name),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return false
+    func renameSession(sessionId: String, name: String) async throws {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SessionAPIError.invalidName }
+        let payload = try await request(ITerm2Messages.rename(sessionId: sessionId, name: name), expectedField: 132)
+        let fields = try MessageFields(payload)
+        if let error = fields.bytes[1]?.first {
+            let reason = try MessageFields(error).strings(2).first ?? "Unable to rename session."
+            throw ITerm2APIError.serverError(reason)
         }
-        let (id, data) = ITerm2Messages.setProfileProperty(sessionId: sessionId, key: "Name", jsonValue: jsonString)
-        switch sendSync(data, id: id) {
-        case .success(let (fieldNumber, _)):
-            return fieldNumber == 105
-        case .failure:
-            return false
-        }
+        guard fields.bytes[2] != nil else { throw SessionAPIError.unexpectedResponse }
+    }
+
+    func splitPane(sessionId: String, profile: String, vertical: Bool) async throws {
+        let payload = try await request(ITerm2Messages.split(sessionId: sessionId, profile: profile, vertical: vertical), expectedField: 109)
+        try MessageFields(payload).requireOK("Split pane")
+    }
+
+    func closeSession(sessionId: String) async throws {
+        let payload = try await request(ITerm2Messages.close(sessionId: sessionId), expectedField: 131)
+        let fields = try MessageFields(payload)
+        guard fields.integers[1]?.count == 1 else { throw SessionAPIError.unexpectedResponse }
+        try fields.requireOK("Close session")
     }
 }

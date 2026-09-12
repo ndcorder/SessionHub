@@ -1,6 +1,7 @@
 import SwiftUI
 
 /// The main content view displayed in the menu bar dropdown.
+@MainActor
 struct MenuBarView: View {
     @Bindable var store: SessionStore
     @State private var renamingSession: ITerm2Bridge.SessionInfo?
@@ -187,8 +188,9 @@ struct MenuBarView: View {
                 // Inline rename field
                 HStack(spacing: 6) {
                     TextField("Session name", text: $renameText, onCommit: {
-                        store.renameSession(session, to: renameText)
-                        renamingSession = nil
+                        Task {
+                            if await store.renameSession(session, to: renameText) { renamingSession = nil }
+                        }
                     })
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.caption))
@@ -197,8 +199,9 @@ struct MenuBarView: View {
                     .onExitCommand { renamingSession = nil }
 
                     Button("OK") {
-                        store.renameSession(session, to: renameText)
-                        renamingSession = nil
+                        Task {
+                            if await store.renameSession(session, to: renameText) { renamingSession = nil }
+                        }
                     }
                     .font(.caption)
                     .buttonStyle(.bordered)

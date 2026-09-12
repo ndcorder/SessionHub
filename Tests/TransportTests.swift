@@ -9,6 +9,7 @@ final class FakeTransport: APITransport {
     private var events: [(Data?, Bool, Error?)] = []
     private var writes: [Data] = []
     private var originalStateUpdate: ((APITransportState) -> Void)?
+    var onRequest: ((Int64, Int, Data) throws -> Data)?
     private let handshake: Handshake
     init(_ handshake: Handshake = .valid) { self.handshake = handshake }
 
@@ -33,6 +34,19 @@ final class FakeTransport: APITransport {
                 enqueue(Data(data.prefix(19)), false, nil)
                 enqueue(Data(data.dropFirst(19)), false, nil)
             }
+        } else if let onRequest {
+            do {
+                let count = data[1] & 127
+                let offset = count < 126 ? 2 : (count == 126 ? 4 : 10)
+                let mask = Array(data[offset..<(offset + 4)])
+                let payload = Data(data.dropFirst(offset + 4).enumerated().map { $0.element ^ mask[$0.offset % 4] })
+                let message = try ITerm2Messages.decodeResponse(payload)
+                let response = try onRequest(message.id!, message.fieldNumber, message.payload)
+                var envelope = ProtobufEncoder()
+                envelope.writeInt64(1, value: message.id!)
+                envelope.writeMessage(message.fieldNumber, value: response)
+                enqueue(serverFrame(envelope.data), false, nil)
+            } catch { enqueue(nil, false, error) }
         }
     }
     func receive(completion: @escaping (Data?, Bool, Error?) -> Void) {
